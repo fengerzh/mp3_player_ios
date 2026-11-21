@@ -11,6 +11,7 @@
 		1A0000000000000000000013 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000012 /* ContentView.swift */; };
 		1A0000000000000000000015 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000014 /* Models.swift */; };
 		1A0000000000000000000017 /* AudioEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000016 /* AudioEngine.swift */; };
+		1A000000000000000000001E /* SiriSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000000000000000000001D /* SiriSupport.swift */; };
 		1A000000000000000000001A /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000019 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
@@ -20,6 +21,7 @@
 		1A0000000000000000000012 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		1A0000000000000000000014 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
 		1A0000000000000000000016 /* AudioEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioEngine.swift; sourceTree = "<group>"; };
+		1A000000000000000000001D /* SiriSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SiriSupport.swift; sourceTree = "<group>"; };
 		1A0000000000000000000018 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		1A0000000000000000000019 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -58,6 +60,7 @@
 				1A0000000000000000000012 /* ContentView.swift */,
 				1A0000000000000000000014 /* Models.swift */,
 				1A0000000000000000000016 /* AudioEngine.swift */,
+				1A000000000000000000001D /* SiriSupport.swift */,
 				1A0000000000000000000018 /* Info.plist */,
 				1A0000000000000000000019 /* Assets.xcassets */,
 			);
@@ -103,7 +106,7 @@
 			};
 			buildConfigurationList = 1A0000000000000000000009 /* Build configuration list for PBXProject "MP3Player" */;
 			compatibilityVersion = "Xcode 16.0";
-			developmentRegion = en;
+			developmentRegion = zh-Hans;
 			hasScannedForEncodings = 0;
 			knownRegions = (
 				en,
@@ -139,6 +142,7 @@
 				1A0000000000000000000013 /* ContentView.swift in Sources */,
 				1A0000000000000000000015 /* Models.swift in Sources */,
 				1A0000000000000000000017 /* AudioEngine.swift in Sources */,
+				1A000000000000000000001E /* SiriSupport.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

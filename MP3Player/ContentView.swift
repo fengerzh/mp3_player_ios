@@ -30,26 +30,14 @@ private enum Palette {
 }
 
 struct ContentView: View {
-    @StateObject private var store: LibraryStore
-    @StateObject private var engine: AudioEngine
+    // 与 Siri Intent 共用同一套播放状态（恢复逻辑在 PlaybackController 里）
+    @ObservedObject private var store = PlaybackController.shared.store
+    @ObservedObject private var engine = PlaybackController.shared.engine
     @State private var showingFolderImporter = false
     @State private var showingFileImporter = false
     @State private var showingFolderSwitcher = false
     @State private var importedMessage: String?
     @Environment(\.scenePhase) private var scenePhase
-
-    init() {
-        let library = LibraryStore()
-        let player = AudioEngine(store: library)
-        // 启动时恢复当前文件夹上次听到的曲目（只显示进度，不自动播放）
-        if let folderID = library.currentFolderID,
-           let lastID = library.lastTrackID(for: folderID),
-           library.visibleTracks.contains(where: { $0.id == lastID }) {
-            player.prepare(id: lastID)
-        }
-        _store = StateObject(wrappedValue: library)
-        _engine = StateObject(wrappedValue: player)
-    }
 
     private var currentFolderTracks: [Track] { store.visibleTracks }
 
@@ -238,7 +226,7 @@ struct ContentView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 11))
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("MP3播放器")
+                Text("随听")
                     .font(.system(size: 20, weight: .bold))
                     .foregroundStyle(Palette.ink)
                 Text("本地音乐播放")
