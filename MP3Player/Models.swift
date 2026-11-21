@@ -27,6 +27,73 @@ private struct LegacyTrack: Codable {
     var duration: Double
 }
 
+struct ImportStatus: Sendable {
+    let folderName: String
+    let done: Int
+    let total: Int
+}
+
+private struct CopiedTrack: Sendable {
+    let id: String
+    let name: String
+}
+
+/// 后台扫描文件夹里的音频文件（不阻塞界面）。
+private func scanAudioFiles(in folderURL: URL, extensions: [String]) async -> [URL] {
+    await Task.detached(priority: .userInitiated) {
+        let fm = FileManager.default
+        var sources: [URL] = []
+        if let enumerator = fm.enumerator(
+            at: folderURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            while let fileURL = enumerator.nextObject() as? URL {
+                guard extensions.contains(fileURL.pathExtension.lowercased()) else { continue }
+                sources.append(fileURL)
+            }
+        }
+        sources.sort { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+        return sources
+    }.value
+}
+
+/// 后台逐个复制音频到沙盒，每完成一首回报一次进度（不阻塞界面）。
+private func copyAudioFiles(
+    _ sources: [URL],
+    to tracksDir: URL,
+    progress: @escaping @Sendable (Int, Int) -> Void
+) async -> [CopiedTrack] {
+    await Task.detached(priority: .userInitiated) {
+        let fm = FileManager.default
+        let total = sources.count
+        progress(0, total)
+        var added: [CopiedTrack] = []
+        var usedNames = Set<String>()
+        for (index, source) in sources.enumerated() {
+            let fileScoped = source.startAccessingSecurityScopedResource()
+            defer { if fileScoped { source.stopAccessingSecurityScopedResource() } }
+            let ext = source.pathExtension.lowercased()
+            let base = source.deletingPathExtension().lastPathComponent
+            var fileName = "\(base).\(ext)"
+            var n = 2
+            while usedNames.contains(fileName) || fm.fileExists(atPath: tracksDir.appendingPathComponent(fileName).path) {
+                fileName = "\(base) \(n).\(ext)"
+                n += 1
+            }
+            usedNames.insert(fileName)
+            do {
+                try fm.copyItem(at: source, to: tracksDir.appendingPathComponent(fileName))
+                added.append(CopiedTrack(id: fileName, name: base))
+            } catch {
+                print("导入失败 \(source.lastPathComponent): \(error)")
+            }
+            progress(index + 1, total)
+        }
+        return added
+    }.value
+}
+
 @MainActor
 final class LibraryStore: ObservableObject {
     static let supportedSpeeds: [Float] = [1.0, 1.25, 1.5, 2.0, 3.0]
@@ -41,6 +108,10 @@ final class LibraryStore: ObservableObject {
     @Published var speed: Float {
         didSet { persist() }
     }
+    @Published private(set) var importStatus: ImportStatus?
+
+    /// 导入代号：用于丢弃过期的进度回调，避免遮罩在导入结束后被旧 Task 重新点亮。
+    private var importGeneration: UInt64 = 0
 
     private var lastTrackIDByFolder: [String: String] = [:]
     private let tracksDir: URL
@@ -92,7 +163,7 @@ final class LibraryStore: ObservableObject {
         let decoder = JSONDecoder()
         if var library = try? decoder.decode(Library.self, from: data) {
             // 过滤掉文件或文件夹已不存在的脏数据
-            var validFolders = library.folders
+            let validFolders = library.folders
             if let saved = library.currentFolderID, !validFolders.contains(where: { $0.id == saved }) {
                 library.currentFolderID = validFolders.first?.id
             }
@@ -158,25 +229,24 @@ final class LibraryStore: ObservableObject {
 
     /// 从文件 App 选中的文件夹批量导入其中所有音频（含子文件夹）。
     /// 同名文件夹再次导入时视为刷新：先清掉旧副本，避免重复堆积。
-    func importFolder(_ url: URL) -> Int {
+    /// 扫描与文件复制在后台线程执行，主线程只更新界面状态，避免卡顿。
+    func importFolder(_ url: URL) async -> Int {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         guard url.hasDirectoryPath else { return 0 }
 
         let name = url.deletingPathExtension().lastPathComponent
-        let fm = FileManager.default
-        var sources: [URL] = []
-        if let enumerator = fm.enumerator(
-            at: url,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) {
-            for case let fileURL as URL in enumerator {
-                guard audioExtensions.contains(fileURL.pathExtension.lowercased()) else { continue }
-                sources.append(fileURL)
-            }
+        importGeneration += 1
+        let generation = importGeneration
+        importStatus = ImportStatus(folderName: name, done: 0, total: 0)
+
+        // 后台扫描
+        let sources = await scanAudioFiles(in: url, extensions: audioExtensions)
+        guard generation == importGeneration else { return 0 }
+        guard !sources.isEmpty else {
+            importStatus = nil
+            return 0
         }
-        sources.sort { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
 
         let folderID: String
         if let existing = folders.first(where: { $0.name == name }) {
@@ -187,69 +257,57 @@ final class LibraryStore: ObservableObject {
             folders.append(Folder(id: folderID, name: name))
         }
 
-        var addedIDs: [String] = []
-        for source in sources {
-            let fileScoped = source.startAccessingSecurityScopedResource()
-            defer { if fileScoped { source.stopAccessingSecurityScopedResource() } }
-            let ext = source.pathExtension.lowercased()
-            let base = source.deletingPathExtension().lastPathComponent
-            let id = uniqueFileName(base: base, ext: ext)
-            do {
-                try fm.copyItem(at: source, to: tracksDir.appendingPathComponent(id))
-                tracks.append(Track(id: id, name: base, folderID: folderID, position: 0, duration: 0))
-                addedIDs.append(id)
-            } catch {
-                print("导入失败 \(source.lastPathComponent): \(error)")
+        // 后台逐个复制并回报进度（丢弃过期代号）
+        let dir = tracksDir
+        let copied = await copyAudioFiles(sources, to: dir) { [weak self] done, total in
+            Task { @MainActor in
+                guard let self, self.importGeneration == generation else { return }
+                self.importStatus = ImportStatus(folderName: name, done: done, total: total)
             }
         }
 
-        if !addedIDs.isEmpty {
+        // 回到主线程一次性更新数据，只写盘一次
+        if !copied.isEmpty {
+            for item in copied {
+                tracks.append(Track(id: item.id, name: item.name, folderID: folderID, position: 0, duration: 0))
+            }
             currentFolderID = folderID
-            lastTrackIDByFolder[folderID] = addedIDs.first
+            lastTrackIDByFolder[folderID] = copied.first?.id
+            persist()
         }
-        persist()
-        return addedIDs.count
+        importStatus = nil
+        return copied.count
     }
 
-    /// 兼容原有能力：单曲导入归入固定的「单曲」文件夹。
-    func importFiles(_ urls: [URL]) -> Int {
+    /// 兼容原有能力：单曲导入归入固定的「单曲」文件夹。复制同样走后台。
+    func importFiles(_ urls: [URL]) async -> Int {
+        let valid = urls.filter { $0.isFileURL && !$0.hasDirectoryPath && audioExtensions.contains($0.pathExtension.lowercased()) }
+        guard !valid.isEmpty else { return 0 }
+        importGeneration += 1
+        let generation = importGeneration
+        importStatus = ImportStatus(folderName: "单曲", done: 0, total: valid.count)
+
+        let dir = tracksDir
+        let copied = await copyAudioFiles(valid, to: dir) { [weak self] done, total in
+            Task { @MainActor in
+                guard let self, self.importGeneration == generation else { return }
+                self.importStatus = ImportStatus(folderName: "单曲", done: done, total: total)
+            }
+        }
+
+        importStatus = nil
+        guard !copied.isEmpty else { return 0 }
         let folderID = "single_tracks"
         if !folders.contains(where: { $0.id == folderID }) {
             folders.append(Folder(id: folderID, name: "单曲"))
         }
-        var addedIDs: [String] = []
-        for source in urls {
-            let scoped = source.startAccessingSecurityScopedResource()
-            defer { if scoped { source.stopAccessingSecurityScopedResource() } }
-            guard source.isFileURL, !source.hasDirectoryPath else { continue }
-            let ext = source.pathExtension.lowercased()
-            guard audioExtensions.contains(ext) else { continue }
-            let base = source.deletingPathExtension().lastPathComponent
-            let id = uniqueFileName(base: base, ext: ext)
-            do {
-                try FileManager.default.copyItem(at: source, to: tracksDir.appendingPathComponent(id))
-                tracks.append(Track(id: id, name: base, folderID: folderID, position: 0, duration: 0))
-                addedIDs.append(id)
-            } catch {
-                print("导入失败 \(source.lastPathComponent): \(error)")
-            }
+        for item in copied {
+            tracks.append(Track(id: item.id, name: item.name, folderID: folderID, position: 0, duration: 0))
         }
-        if !addedIDs.isEmpty {
-            currentFolderID = folderID
-            lastTrackIDByFolder[folderID] = addedIDs.first
-        }
+        currentFolderID = folderID
+        lastTrackIDByFolder[folderID] = copied.first?.id
         persist()
-        return addedIDs.count
-    }
-
-    private func uniqueFileName(base: String, ext: String) -> String {
-        var name = "\(base).\(ext)"
-        var index = 2
-        while FileManager.default.fileExists(atPath: tracksDir.appendingPathComponent(name).path) {
-            name = "\(base) \(index).\(ext)"
-            index += 1
-        }
-        return name
+        return copied.count
     }
 
     // MARK: - 文件夹与进度

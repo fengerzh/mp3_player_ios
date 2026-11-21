@@ -57,6 +57,11 @@ struct ContentView: View {
         NavigationStack {
             ZStack {
                 Palette.page.ignoresSafeArea()
+                if let status = store.importStatus {
+                    importOverlay(status: status)
+                        .zIndex(10)
+                        .transition(.opacity)
+                }
                 ScrollView {
                     VStack(spacing: 14) {
                         header
@@ -83,7 +88,7 @@ struct ContentView: View {
                         var total = 0
                         var folderNames: [String] = []
                         for url in urls {
-                            total += store.importFolder(url)
+                            total += await store.importFolder(url)
                             folderNames.append(url.deletingPathExtension().lastPathComponent)
                         }
                         importedMessage = total > 0
@@ -103,7 +108,7 @@ struct ContentView: View {
                 Task { @MainActor in
                     switch result {
                     case .success(let urls):
-                        let count = store.importFiles(urls)
+                        let count = await store.importFiles(urls)
                         importedMessage = count > 0 ? "已导入 \(count) 首" : "没有可导入的音频文件"
                         restoreFolderPlayback()
                     case .failure(let error):
@@ -123,7 +128,7 @@ struct ContentView: View {
                 }
                 group.notify(queue: .main) {
                     Task { @MainActor in
-                        let count = store.importFiles(urls)
+                        let count = await store.importFiles(urls)
                         importedMessage = count > 0 ? "已导入 \(count) 首" : "没有可导入的音频文件"
                         restoreFolderPlayback()
                     }
@@ -132,7 +137,7 @@ struct ContentView: View {
             }
             .onOpenURL { url in
                 Task { @MainActor in
-                    let count = store.importFiles([url])
+                    let count = await store.importFiles([url])
                     importedMessage = count > 0 ? "已导入 \(count) 首" : "没有可导入的音频文件"
                     restoreFolderPlayback()
                 }
@@ -157,6 +162,58 @@ struct ContentView: View {
                 Text(importedMessage ?? "")
             }
         }
+    }
+
+    private func importOverlay(status: ImportStatus) -> some View {
+        ZStack {
+            Color(hex: "1A1A2E").opacity(0.45)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+            VStack(spacing: 18) {
+                ZStack {
+                    Circle().fill(Palette.primary)
+                        .frame(width: 52, height: 52)
+                    Circle()
+                        .trim(from: 0, to: 0.72)
+                        .stroke(Color.white, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                        .frame(width: 26, height: 26)
+                        .rotationEffect(.degrees(status.total > 0 ? Double(status.done) / Double(status.total) * 360 : -90))
+                        .animation(.linear(duration: 0.25), value: status.done)
+                }
+                VStack(spacing: 6) {
+                    Text("正在导入「\(status.folderName)」")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(Palette.ink)
+                    if status.total > 0 {
+                        Text("已导入 \(status.done) / \(status.total) 首")
+                            .font(.system(size: 13))
+                            .foregroundStyle(Palette.muted)
+                    } else {
+                        Text("正在扫描音频文件…")
+                            .font(.system(size: 13))
+                            .foregroundStyle(Palette.muted)
+                    }
+                }
+                if status.total > 0 {
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(Palette.chipIdle)
+                            Capsule().fill(Palette.primary)
+                                .frame(width: geo.size.width * CGFloat(status.done) / CGFloat(status.total))
+                                .animation(.linear(duration: 0.25), value: status.done)
+                        }
+                    }
+                    .frame(height: 7)
+                    .padding(.horizontal, 8)
+                }
+            }
+            .padding(.vertical, 28)
+            .padding(.horizontal, 24)
+            .frame(width: min(300, UIScreen.main.bounds.width - 64))
+            .background(Color.white)
+            .clipShape(RoundedRectangle(cornerRadius: 18))
+        }
+        .allowsHitTesting(true)
     }
 
     private func restoreFolderPlayback() {
