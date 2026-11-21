@@ -32,15 +32,26 @@ private enum Palette {
 struct ContentView: View {
     @StateObject private var store: LibraryStore
     @StateObject private var engine: AudioEngine
-    @State private var showingImporter = false
+    @State private var showingFolderImporter = false
+    @State private var showingFileImporter = false
+    @State private var showingFolderSwitcher = false
     @State private var importedMessage: String?
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
         let library = LibraryStore()
+        let player = AudioEngine(store: library)
+        // 启动时恢复当前文件夹上次听到的曲目（只显示进度，不自动播放）
+        if let folderID = library.currentFolderID,
+           let lastID = library.lastTrackID(for: folderID),
+           library.visibleTracks.contains(where: { $0.id == lastID }) {
+            player.prepare(id: lastID)
+        }
         _store = StateObject(wrappedValue: library)
-        _engine = StateObject(wrappedValue: AudioEngine(store: library))
+        _engine = StateObject(wrappedValue: player)
     }
+
+    private var currentFolderTracks: [Track] { store.visibleTracks }
 
     var body: some View {
         NavigationStack {
@@ -49,7 +60,8 @@ struct ContentView: View {
                 ScrollView {
                     VStack(spacing: 14) {
                         header
-                        importButton
+                        folderCard
+                        importRow
                         playerCard
                         playlistCard
                     }
@@ -61,7 +73,30 @@ struct ContentView: View {
             }
             .navigationBarHidden(true)
             .fileImporter(
-                isPresented: $showingImporter,
+                isPresented: $showingFolderImporter,
+                allowedContentTypes: [.folder],
+                allowsMultipleSelection: true
+            ) { result in
+                Task { @MainActor in
+                    switch result {
+                    case .success(let urls):
+                        var total = 0
+                        var folderNames: [String] = []
+                        for url in urls {
+                            total += store.importFolder(url)
+                            folderNames.append(url.deletingPathExtension().lastPathComponent)
+                        }
+                        importedMessage = total > 0
+                            ? "已从 \(folderNames.count) 个文件夹导入 \(total) 首"
+                            : "所选文件夹里没有音频文件"
+                        restoreFolderPlayback()
+                    case .failure(let error):
+                        importedMessage = "导入失败：\(error.localizedDescription)"
+                    }
+                }
+            }
+            .fileImporter(
+                isPresented: $showingFileImporter,
                 allowedContentTypes: [.audio, .mp3],
                 allowsMultipleSelection: true
             ) { result in
@@ -70,6 +105,7 @@ struct ContentView: View {
                     case .success(let urls):
                         let count = store.importFiles(urls)
                         importedMessage = count > 0 ? "已导入 \(count) 首" : "没有可导入的音频文件"
+                        restoreFolderPlayback()
                     case .failure(let error):
                         importedMessage = "导入失败：\(error.localizedDescription)"
                     }
@@ -89,6 +125,7 @@ struct ContentView: View {
                     Task { @MainActor in
                         let count = store.importFiles(urls)
                         importedMessage = count > 0 ? "已导入 \(count) 首" : "没有可导入的音频文件"
+                        restoreFolderPlayback()
                     }
                 }
                 return true
@@ -97,12 +134,16 @@ struct ContentView: View {
                 Task { @MainActor in
                     let count = store.importFiles([url])
                     importedMessage = count > 0 ? "已导入 \(count) 首" : "没有可导入的音频文件"
+                    restoreFolderPlayback()
                 }
             }
             .onChange(of: scenePhase) { _, phase in
                 if phase == .background || phase == .inactive {
                     engine.persistProgress()
                 }
+            }
+            .sheet(isPresented: $showingFolderSwitcher) {
+                FolderSwitcherView(store: store, engine: engine)
             }
             .alert(
                 "导入结果",
@@ -115,6 +156,18 @@ struct ContentView: View {
             } message: {
                 Text(importedMessage ?? "")
             }
+        }
+    }
+
+    private func restoreFolderPlayback() {
+        guard let folderID = store.currentFolderID else {
+            engine.unload()
+            return
+        }
+        if let lastID = store.lastTrackID(for: folderID), store.visibleTracks.contains(where: { $0.id == lastID }) {
+            engine.prepare(id: lastID)
+        } else {
+            engine.unload()
         }
     }
 
@@ -158,21 +211,68 @@ struct ContentView: View {
         .clipShape(RoundedRectangle(cornerRadius: 16))
     }
 
-    private var importButton: some View {
-        Button { showingImporter = true } label: {
-            HStack(spacing: 8) {
-                Image(systemName: "folder.badge.plus")
-                    .font(.system(size: 17, weight: .medium))
-                Text("导入 MP3")
-                    .font(.system(size: 15, weight: .semibold))
+    private var folderCard: some View {
+        Button { showingFolderSwitcher = true } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "folder.fill")
+                    .font(.system(size: 17))
+                    .foregroundStyle(Palette.primary)
+                    .frame(width: 30, height: 30)
+                    .background(Color(hex: "E8F0FE"))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("当前文件夹")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Palette.muted)
+                    Text(store.currentFolderName)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(Palette.ink)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 4)
+                if !currentFolderTracks.isEmpty {
+                    Text("\(currentFolderTracks.count) 首")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Palette.primary)
+                }
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Palette.muted)
             }
-            .foregroundStyle(.white)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 13)
-            .background(Palette.primary)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 11)
+            .background(Color.white)
             .clipShape(RoundedRectangle(cornerRadius: 14))
         }
         .buttonStyle(.plain)
+    }
+
+    private var importRow: some View {
+        VStack(spacing: 8) {
+            Button { showingFolderImporter = true } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "folder.badge.plus")
+                        .font(.system(size: 17, weight: .medium))
+                    Text("导入文件夹")
+                        .font(.system(size: 15, weight: .semibold))
+                }
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 13)
+                .background(Palette.primary)
+                .clipShape(RoundedRectangle(cornerRadius: 14))
+            }
+            .buttonStyle(.plain)
+
+            Button { showingFileImporter = true } label: {
+                Text("只导入单个文件")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Palette.muted)
+                    .underline()
+            }
+            .buttonStyle(.plain)
+        }
     }
 
     private var playerCard: some View {
@@ -304,15 +404,15 @@ struct ContentView: View {
                     .font(.system(size: 15, weight: .bold))
                     .foregroundStyle(Palette.ink)
                 Spacer()
-                Text("\(store.tracks.count) 首歌曲")
+                Text("\(currentFolderTracks.count) 首歌曲")
                     .font(.system(size: 12))
                     .foregroundStyle(Palette.primary)
             }
 
-            if store.tracks.isEmpty {
+            if currentFolderTracks.isEmpty {
                 emptyView
             } else {
-                ForEach(store.tracks) { track in
+                ForEach(currentFolderTracks) { track in
                     trackRow(track)
                 }
             }
@@ -324,13 +424,13 @@ struct ContentView: View {
 
     private var emptyView: some View {
         VStack(spacing: 10) {
-            Image(systemName: "music.note.list")
+            Image(systemName: "folder.badge.plus")
                 .font(.system(size: 44))
                 .foregroundStyle(Palette.muted)
-            Text("还没有歌曲")
+            Text("这个文件夹还没有歌曲")
                 .font(.system(size: 16, weight: .medium))
                 .foregroundStyle(Palette.ink)
-            Text("点上方「导入 MP3」从文件 App 选择歌曲")
+            Text("点上方「导入文件夹」从文件 App 一次选整个文件夹")
                 .font(.system(size: 12))
                 .foregroundStyle(Palette.muted)
                 .multilineTextAlignment(.center)
@@ -399,5 +499,57 @@ struct ContentView: View {
         guard seconds.isFinite, seconds > 0 else { return "0:00" }
         let total = Int(seconds)
         return String(format: "%d:%02d", total / 60, total % 60)
+    }
+}
+
+private struct FolderSwitcherView: View {
+    @ObservedObject var store: LibraryStore
+    @ObservedObject var engine: AudioEngine
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List {
+                ForEach(store.folders) { folder in
+                    Button {
+                        store.selectFolder(folder.id)
+                        if let lastID = store.lastTrackID(for: folder.id),
+                           store.visibleTracks.contains(where: { $0.id == lastID }) {
+                            engine.prepare(id: lastID)
+                        } else {
+                            engine.unload()
+                        }
+                        dismiss()
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "folder.fill")
+                                .foregroundStyle(Palette.primary)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(folder.name)
+                                    .font(.system(size: 14, weight: .medium))
+                                    .foregroundStyle(Palette.ink)
+                                Text("\(store.tracks.filter { $0.folderID == folder.id }.count) 首")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(Palette.muted)
+                            }
+                            Spacer()
+                            if store.currentFolderID == folder.id {
+                                Image(systemName: "checkmark")
+                                    .foregroundStyle(Palette.primary)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .navigationTitle("切换文件夹")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("完成") { dismiss() }
+                }
+            }
+        }
     }
 }

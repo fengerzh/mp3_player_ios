@@ -34,8 +34,29 @@ final class AudioEngine: ObservableObject {
         return store.tracks.first { $0.id == id }
     }
 
+    /// 切换文件夹时只恢复曲目信息（不自动播放），进度条显示该文件夹上次的进度
+    func prepare(id: String) {
+        guard let track = store.tracks.first(where: { $0.id == id }) else { return }
+        detachPlayer()
+        currentId = id
+        duration = track.duration
+        currentTime = track.position
+        isPlaying = false
+        updateNowPlaying()
+    }
+
+    func unload() {
+        detachPlayer()
+        currentId = nil
+        currentTime = 0
+        duration = 0
+        isPlaying = false
+        updateNowPlaying()
+    }
+
     func play(id: String) {
         guard let track = store.tracks.first(where: { $0.id == id }) else { return }
+        store.rememberTrack(id)
 
         if currentId == id, let player = player {
             if track.duration > 0 && currentTime >= track.duration - 0.5 {
@@ -66,9 +87,9 @@ final class AudioEngine: ObservableObject {
     }
 
     func toggle() {
-        if let id = currentId {
+        if let id = currentId, store.visibleTracks.contains(where: { $0.id == id }) {
             if isPlaying { pause() } else { play(id: id) }
-        } else if let first = store.tracks.first {
+        } else if let first = store.visibleTracks.first {
             play(id: first.id)
         }
     }
@@ -80,19 +101,19 @@ final class AudioEngine: ObservableObject {
         updateNowPlaying()
     }
 
-    func next() {
-        guard let id = currentId,
-              !store.tracks.isEmpty,
-              let index = store.tracks.firstIndex(where: { $0.id == id }) else { return }
-        play(id: store.tracks[(index + 1) % store.tracks.count].id)
+    private func skipInFolder(_ delta: Int) {
+        let list = store.visibleTracks
+        guard !list.isEmpty else { return }
+        if let id = currentId, let index = list.firstIndex(where: { $0.id == id }) {
+            play(id: list[(index + delta + list.count) % list.count].id)
+        } else {
+            play(id: list[delta > 0 ? 0 : list.count - 1].id)
+        }
     }
 
-    func previous() {
-        guard let id = currentId,
-              !store.tracks.isEmpty,
-              let index = store.tracks.firstIndex(where: { $0.id == id }) else { return }
-        play(id: store.tracks[(index - 1 + store.tracks.count) % store.tracks.count].id)
-    }
+    func next() { skipInFolder(1) }
+
+    func previous() { skipInFolder(-1) }
 
     func seek(to seconds: Double) {
         guard let player else { return }
