@@ -563,6 +563,14 @@ private struct FolderSwitcherView: View {
     @ObservedObject var store: LibraryStore
     @ObservedObject var engine: AudioEngine
     @Environment(\.dismiss) private var dismiss
+    @State private var pendingDelete: Folder?
+
+    private var deleteAlertBinding: Binding<Bool> {
+        Binding(
+            get: { pendingDelete != nil },
+            set: { present in if !present { pendingDelete = nil } }
+        )
+    }
 
     var body: some View {
         NavigationStack {
@@ -598,6 +606,13 @@ private struct FolderSwitcherView: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                        Button(role: .destructive) {
+                            pendingDelete = folder
+                        } label: {
+                            Label("删除", systemImage: "trash")
+                        }
+                    }
                 }
             }
             .navigationTitle("切换文件夹")
@@ -605,6 +620,22 @@ private struct FolderSwitcherView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("完成") { dismiss() }
+                }
+            }
+            .alert("删除文件夹", isPresented: deleteAlertBinding) {
+                Button("取消", role: .cancel) { pendingDelete = nil }
+                Button("删除", role: .destructive) {
+                    guard let folder = pendingDelete else { return }
+                    for id in store.tracks.filter({ $0.folderID == folder.id }).map({ $0.id }) {
+                        engine.stopForRemoval(id: id)
+                    }
+                    store.removeFolder(folder.id)
+                    pendingDelete = nil
+                }
+            } message: {
+                if let folder = pendingDelete {
+                    let count = store.tracks.filter { $0.folderID == folder.id }.count
+                    Text("「\(folder.name)」里的 \(count) 首歌曲及播放进度会从 App 中删除。文件 App 里的源文件不受影响。")
                 }
             }
         }

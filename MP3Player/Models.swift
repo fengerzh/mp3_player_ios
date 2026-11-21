@@ -38,6 +38,13 @@ private struct CopiedTrack: Sendable {
     let name: String
 }
 
+/// 增量同步结果：reused=true 表示复用沙盒里已有的文件（播放进度保留）。
+private struct SyncedTrack: Sendable {
+    let id: String
+    let name: String
+    let reused: Bool
+}
+
 /// 后台扫描文件夹里的音频文件（不阻塞界面）。
 private func scanAudioFiles(in folderURL: URL, extensions: [String]) async -> [URL] {
     await Task.detached(priority: .userInitiated) {
@@ -91,6 +98,49 @@ private func copyAudioFiles(
             progress(index + 1, total)
         }
         return added
+    }.value
+}
+
+/// 后台增量同步：沙盒里已有的同名文件直接复用，只复制新增的；每首回报进度。
+/// existingByBase 的 key 是去掉扩展名的文件名，value 是它在 Tracks 目录里的实际文件名。
+private func syncAudioFiles(
+    _ sources: [URL],
+    to tracksDir: URL,
+    existingByBase: [String: String],
+    progress: @escaping @Sendable (Int, Int) -> Void
+) async -> [SyncedTrack] {
+    await Task.detached(priority: .userInitiated) {
+        let fm = FileManager.default
+        let total = sources.count
+        progress(0, total)
+        var result: [SyncedTrack] = []
+        var usedNames = Set(existingByBase.values)
+        for (index, source) in sources.enumerated() {
+            let ext = source.pathExtension.lowercased()
+            let base = source.deletingPathExtension().lastPathComponent
+            if let reusedID = existingByBase[base] {
+                result.append(SyncedTrack(id: reusedID, name: base, reused: true))
+                progress(index + 1, total)
+                continue
+            }
+            let fileScoped = source.startAccessingSecurityScopedResource()
+            defer { if fileScoped { source.stopAccessingSecurityScopedResource() } }
+            var fileName = "\(base).\(ext)"
+            var n = 2
+            while usedNames.contains(fileName) || fm.fileExists(atPath: tracksDir.appendingPathComponent(fileName).path) {
+                fileName = "\(base) \(n).\(ext)"
+                n += 1
+            }
+            usedNames.insert(fileName)
+            do {
+                try fm.copyItem(at: source, to: tracksDir.appendingPathComponent(fileName))
+                result.append(SyncedTrack(id: fileName, name: base, reused: false))
+            } catch {
+                print("导入失败 \(source.lastPathComponent): \(error)")
+            }
+            progress(index + 1, total)
+        }
+        return result
     }.value
 }
 
@@ -151,9 +201,26 @@ final class LibraryStore: ObservableObject {
         if !FileManager.default.fileExists(atPath: tracksDir.path) {
             try? FileManager.default.createDirectory(at: tracksDir, withIntermediateDirectories: true)
         }
+        // 这些歌都能从「文件」App 的源文件重新导入，不进 iCloud 备份，避免同时占手机和云空间。
+        var backupDir = tracksDir
+        var dirValues = URLResourceValues()
+        dirValues.isExcludedFromBackup = true
+        try? backupDir.setResourceValues(dirValues)
         let stored = defaults.object(forKey: speedKey) as? Float ?? 1.0
         speed = Self.supportedSpeeds.contains(stored) ? stored : 1.0
         loadLibrary()
+        cleanupOrphanFiles()
+    }
+
+    /// 清理 Tracks 目录里没有曲库记录的孤儿文件（例如导入中途失败留下的半截副本）。
+    private func cleanupOrphanFiles() {
+        let fm = FileManager.default
+        let known = Set(tracks.map { $0.id })
+        guard let files = try? fm.contentsOfDirectory(at: tracksDir, includingPropertiesForKeys: nil) else { return }
+        for file in files where !known.contains(file.lastPathComponent) {
+            try? fm.removeItem(at: file)
+            print("清理孤儿文件: \(file.lastPathComponent)")
+        }
     }
 
     // MARK: - 持久化与迁移
@@ -228,7 +295,7 @@ final class LibraryStore: ObservableObject {
     // MARK: - 导入
 
     /// 从文件 App 选中的文件夹批量导入其中所有音频（含子文件夹）。
-    /// 同名文件夹再次导入时视为刷新：先清掉旧副本，避免重复堆积。
+    /// 同名文件夹再次导入时做增量同步：保留已有曲目的播放进度，只复制新增文件，清掉源里已删除的旧曲目。
     /// 扫描与文件复制在后台线程执行，主线程只更新界面状态，避免卡顿。
     func importFolder(_ url: URL) async -> Int {
         let scoped = url.startAccessingSecurityScopedResource()
@@ -249,39 +316,62 @@ final class LibraryStore: ObservableObject {
         }
 
         let folderID: String
+        let existingTracks: [Track]
         if let existing = folders.first(where: { $0.name == name }) {
             folderID = existing.id
-            remove(ids: Set(tracks.filter { $0.folderID == folderID }.map { $0.id }))
+            existingTracks = tracks.filter { $0.folderID == folderID }
         } else {
             folderID = "folder_" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
-            folders.append(Folder(id: folderID, name: name))
+            existingTracks = []
         }
 
-        // 后台逐个复制并回报进度（丢弃过期代号）
+        // 已有曲目按「去掉扩展名的文件名」建索引，用于复用沙盒文件、保住进度
+        var existingByBase: [String: String] = [:]
+        for track in existingTracks { existingByBase[track.name] = track.id }
+
+        // 后台增量同步并回报进度（丢弃过期代号）
         let dir = tracksDir
-        let copied = await copyAudioFiles(sources, to: dir) { [weak self] done, total in
+        let synced = await syncAudioFiles(sources, to: dir, existingByBase: existingByBase) { [weak self] done, total in
             Task { @MainActor in
                 guard let self, self.importGeneration == generation else { return }
                 self.importStatus = ImportStatus(folderName: name, done: done, total: total)
             }
         }
+        guard generation == importGeneration else { return 0 }
 
-        // 回到主线程一次性更新数据，只写盘一次
-        if !copied.isEmpty {
-            for item in copied {
-                tracks.append(Track(id: item.id, name: item.name, folderID: folderID, position: 0, duration: 0))
-            }
+        // 回到主线程一次性更新数据：清掉源里已不存在的旧曲目，新增曲目入账，已有曲目原样保留进度。
+        if !folders.contains(where: { $0.id == folderID }) {
+            folders.append(Folder(id: folderID, name: name))
+        }
+        let keptIDs = Set(synced.map { $0.id })
+        let staleIDs = Set(existingTracks.map { $0.id }).subtracting(keptIDs)
+        if !staleIDs.isEmpty { remove(ids: staleIDs) }
+        for item in synced where !item.reused {
+            tracks.append(Track(id: item.id, name: item.name, folderID: folderID, position: 0, duration: 0))
+        }
+        if !synced.isEmpty {
             currentFolderID = folderID
-            lastTrackIDByFolder[folderID] = copied.first?.id
+            if let lastID = lastTrackIDByFolder[folderID], keptIDs.contains(lastID) {
+                // 上次在听的曲目还在，保留它的位置和进度
+            } else {
+                lastTrackIDByFolder[folderID] = synced.first?.id
+            }
             persist()
         }
         importStatus = nil
-        return copied.count
+        return synced.filter { !$0.reused }.count
     }
 
     /// 兼容原有能力：单曲导入归入固定的「单曲」文件夹。复制同样走后台。
     func importFiles(_ urls: [URL]) async -> Int {
-        let valid = urls.filter { $0.isFileURL && !$0.hasDirectoryPath && audioExtensions.contains($0.pathExtension.lowercased()) }
+        // 单曲按文件名去重：同一首歌重复导入不再生成「歌名 2.mp3」这样的第二份副本
+        let singleFolderID = "single_tracks"
+        let existingNames = Set(tracks.filter { $0.folderID == singleFolderID }.map { $0.id })
+        let valid = urls.filter { url in
+            guard url.isFileURL, !url.hasDirectoryPath,
+                  audioExtensions.contains(url.pathExtension.lowercased()) else { return false }
+            return !existingNames.contains(url.lastPathComponent)
+        }
         guard !valid.isEmpty else { return 0 }
         importGeneration += 1
         let generation = importGeneration
@@ -297,7 +387,7 @@ final class LibraryStore: ObservableObject {
 
         importStatus = nil
         guard !copied.isEmpty else { return 0 }
-        let folderID = "single_tracks"
+        let folderID = singleFolderID
         if !folders.contains(where: { $0.id == folderID }) {
             folders.append(Folder(id: folderID, name: "单曲"))
         }
@@ -341,6 +431,18 @@ final class LibraryStore: ObservableObject {
         tracks.removeAll { ids.contains($0.id) }
         for track in removed where lastTrackIDByFolder[track.folderID] == track.id {
             lastTrackIDByFolder.removeValue(forKey: track.folderID)
+        }
+        persist()
+    }
+
+    /// 删除整个文件夹：清掉该文件夹的全部曲目文件、进度记录和文件夹本身。
+    func removeFolder(_ id: String) {
+        guard folders.contains(where: { $0.id == id }) else { return }
+        remove(ids: Set(tracks.filter { $0.folderID == id }.map { $0.id }))
+        folders.removeAll { $0.id == id }
+        lastTrackIDByFolder.removeValue(forKey: id)
+        if currentFolderID == id {
+            currentFolderID = folders.first?.id
         }
         persist()
     }
